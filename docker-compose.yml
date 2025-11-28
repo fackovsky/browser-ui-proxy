@@ -5,6 +5,8 @@ services:
     build: ./tor
     container_name: bui-tor
     restart: unless-stopped
+    volumes:
+      - ./tor/data:/var/lib/tor
 
   renderer:
     build: ./renderer

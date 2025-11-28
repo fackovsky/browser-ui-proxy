@@ -2,3 +2,8 @@ SocksPort 0.0.0.0:9050
 SocksPolicy accept *
 
 Log notice stdout
+
+# Hidden service для нашего proxy-ui
+HiddenServiceDir /var/lib/tor/bui-proxy-ui
+HiddenServiceVersion 3
+HiddenServicePort 80 proxy-ui:8080
