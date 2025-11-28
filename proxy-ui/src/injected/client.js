@@ -1,13 +1,31 @@
 // proxy-ui/src/injected/client.js
 (function () {
+  // Превращаем любой href в "прокси-относительный" путь: /path?query#hash
+  // чтобы не светить proxy-origin в renderer и не заставлять его ходить на наш .onion.
+  function toProxyRelative(href) {
+    if (!href) return "/";
+    try {
+      const u = new URL(href, window.location.href);
+      const path = u.pathname || "/";
+      const search = u.search || "";
+      const hash = u.hash || "";
+      return path + search + hash;
+    } catch (e) {
+      console.warn("toProxyRelative error", e);
+      return href;
+    }
+  }
+
   async function navigateViaProxy(href) {
+    const rel = toProxyRelative(href);
+
     try {
       const resp = await fetch("/__act/nav", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ href })
+        body: JSON.stringify({ href: rel })
       });
 
       if (!resp.ok) {
@@ -45,7 +63,7 @@
     true
   );
 
-  // Перехват отправки форм (для простых GET-форм типа поисковика)
+  // Перехват отправки форм (прототип)
   document.addEventListener(
     "submit",
     function (e) {
@@ -63,23 +81,25 @@
         });
 
         const method = (form.getAttribute("method") || "GET").toUpperCase();
-        const action = form.getAttribute("action") || window.location.href;
+        const actionAttr = form.getAttribute("action");
 
-        const url = new URL(action, window.location.href);
+        // Базовый путь: либо action, либо текущий путь (без origin)
+        const basePath =
+          actionAttr && actionAttr.trim().length > 0
+            ? actionAttr
+            : window.location.pathname +
+              window.location.search +
+              window.location.hash;
 
-        if (method === "GET") {
-          // классический поиск: параметры в query
-          params.forEach((value, key) => {
-            url.searchParams.set(key, value);
-          });
-          navigateViaProxy(url.toString());
-        } else {
-          // пока просто конвертируем POST в GET с query (ограничение прототипа)
-          params.forEach((value, key) => {
-            url.searchParams.set(key, value);
-          });
-          navigateViaProxy(url.toString());
-        }
+        const url = new URL(basePath, window.location.href);
+
+        // Прототип: ВСЕГДА конвертим в GET с query (даже если method=POST)
+        // Это не идеально, но работает для простых форм (поисковые и т.п.).
+        params.forEach((value, key) => {
+          url.searchParams.set(key, value);
+        });
+
+        navigateViaProxy(url.toString());
       } catch (err) {
         console.error("submit interception error", err);
       }
