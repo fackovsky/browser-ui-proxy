@@ -29,8 +29,7 @@ async function getBrowser() {
 }
 
 /**
- * Вспомогалка: переписать url(...) внутри CSS на data: URI,
- * если у нас есть содержимое картинки в imageMap.
+ * Переписать url(...) внутри CSS на data: URI, если у нас есть содержимое картинки.
  */
 function rewriteCssUrls(cssText, baseUrl, imageMap) {
   if (!cssText || typeof cssText !== "string") return cssText;
@@ -39,7 +38,7 @@ function rewriteCssUrls(cssText, baseUrl, imageMap) {
     let inside = p1.trim();
     if (!inside) return match;
 
-    // сохраняем кавычки, если были
+    // сохраняем кавычки
     let quote = "";
     const first = inside[0];
     const last = inside[inside.length - 1];
@@ -61,7 +60,7 @@ function rewriteCssUrls(cssText, baseUrl, imageMap) {
 
     const img = imageMap.get(absUrl);
     if (!img) {
-      return match; // для этого url нет картинки
+      return match;
     }
 
     const contentType = img.contentType || "image/*";
@@ -73,9 +72,10 @@ function rewriteCssUrls(cssText, baseUrl, imageMap) {
 }
 
 /**
- * Общая функция: goto + сбор CSS + сбор картинок + инлайн всего этого.
+ * Общая функция: выполнить действие (goto или form.submit),
+ * параллельно собирать CSS и картинки, и вернуть HTML с инлайном.
  */
-async function gotoWithInlineCssAndImages(sessionId, page, targetUrl) {
+async function runActionWithAssets(sessionId, page, action) {
   const cssChunks = []; // { baseUrl, text }
   const imageMap = new Map(); // absUrl -> { contentType, data(base64) }
 
@@ -105,7 +105,6 @@ async function gotoWithInlineCssAndImages(sessionId, page, targetUrl) {
         const body = await response.body();
         if (body && body.length > 0) {
           let contentType = ct;
-          // Если заголовка нет, пытаемся угадать по расширению
           if (!contentType) {
             if (resUrl.endsWith(".png")) contentType = "image/png";
             else if (resUrl.endsWith(".jpg") || resUrl.endsWith(".jpeg"))
@@ -130,8 +129,15 @@ async function gotoWithInlineCssAndImages(sessionId, page, targetUrl) {
 
   page.on("response", onResponse);
 
-  log("INFO", `Session ${sessionId}: goto ${targetUrl}`);
-  await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 60000 });
+  try {
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "networkidle", timeout: 60000 }),
+      action()
+    ]);
+  } catch (e) {
+    page.off("response", onResponse);
+    throw e;
+  }
 
   page.off("response", onResponse);
 
@@ -161,7 +167,7 @@ async function gotoWithInlineCssAndImages(sessionId, page, targetUrl) {
       `Session ${sessionId}: inlined ${cssChunks.length} CSS resources (with images where possible)`
     );
   } else {
-    log("INFO", `Session ${sessionId}: no CSS captured for ${targetUrl}`);
+    log("INFO", `Session ${sessionId}: no CSS captured`);
   }
 
   return { url: urlNow, html };
@@ -175,10 +181,8 @@ async function createSession(startUrl) {
   const sessionId = crypto.randomBytes(16).toString("hex");
   log("INFO", `New renderer session ${sessionId}: goto ${startUrl}`);
 
-  const { url, html } = await gotoWithInlineCssAndImages(
-    sessionId,
-    page,
-    startUrl
+  const { url, html } = await runActionWithAssets(sessionId, page, () =>
+    page.goto(startUrl)
   );
 
   sessions.set(sessionId, { context, page, lastUrl: url });
@@ -197,11 +201,46 @@ async function navSession(sessionId, href) {
   const baseUrl = lastUrl || page.url() || href;
   const targetUrl = new URL(href, baseUrl).toString();
 
-  const { url, html } = await gotoWithInlineCssAndImages(
-    sessionId,
-    page,
-    targetUrl
+  log("INFO", `Session ${sessionId}: nav to ${targetUrl}`);
+
+  const { url, html } = await runActionWithAssets(sessionId, page, () =>
+    page.goto(targetUrl)
   );
+  sess.lastUrl = url;
+
+  return { url, html };
+}
+
+async function submitSession(sessionId, fields) {
+  const sess = sessions.get(sessionId);
+  if (!sess) {
+    throw new Error(`Unknown sessionId: ${sessionId}`);
+  }
+
+  const { page, lastUrl } = sess;
+  log("INFO", `Session ${sessionId}: submit form on ${lastUrl || page.url()}`);
+
+  const action = () =>
+    page.evaluate((fields) => {
+      const form = document.querySelector("form");
+      if (!form) {
+        throw new Error("No <form> found on the page");
+      }
+
+      for (const [name, value] of Object.entries(fields)) {
+        const el = form.querySelector(`[name="${name}"]`);
+        if (!el) continue;
+
+        const tag = el.tagName.toLowerCase();
+        if (tag === "input" || tag === "textarea" || tag === "select") {
+          el.value = value;
+        }
+      }
+
+      form.submit();
+    }, fields);
+
+  const { url, html } = await runActionWithAssets(sessionId, page, action);
   sess.lastUrl = url;
 
   return { url, html };
@@ -250,7 +289,29 @@ app.post("/session/nav", async (req, res) => {
   }
 });
 
-// (опционально) healthcheck
+// Сабмит формы (например, капча)
+app.post("/session/submit", async (req, res) => {
+  const { sessionId, fields } = req.body || {};
+  if (!sessionId || !fields || typeof fields !== "object") {
+    return res
+      .status(400)
+      .json({ error: "sessionId and fields are required" });
+  }
+
+  try {
+    const result = await submitSession(sessionId, fields);
+    res.status(200).json(result);
+  } catch (e) {
+    log("ERR", `session/submit error: ${e.message}`);
+    if (/Unknown sessionId/.test(e.message)) {
+      res.status(404).json({ error: e.message });
+    } else {
+      res.status(500).json({ error: e.message });
+    }
+  }
+});
+
+// healthcheck
 app.get("/healthz", (req, res) => {
   res.json({ ok: true, sessions: sessions.size });
 });

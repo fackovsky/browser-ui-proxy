@@ -1,7 +1,6 @@
 // proxy-ui/src/injected/client.js
 (function () {
   // Превращаем любой href в "прокси-относительный" путь: /path?query#hash
-  // чтобы не светить proxy-origin в renderer и не заставлять его ходить на наш .onion.
   function toProxyRelative(href) {
     if (!href) return "/";
     try {
@@ -42,6 +41,30 @@
     }
   }
 
+  async function submitViaProxy(fields) {
+    try {
+      const resp = await fetch("/__act/submit", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ fields })
+      });
+
+      if (!resp.ok) {
+        console.error("Proxy submit failed with status", resp.status);
+        return;
+      }
+
+      const html = await resp.text();
+      document.open();
+      document.write(html);
+      document.close();
+    } catch (e) {
+      console.error("Proxy submit error", e);
+    }
+  }
+
   // Перехват кликов по ссылкам
   document.addEventListener(
     "click",
@@ -63,7 +86,7 @@
     true
   );
 
-  // Перехват отправки форм (прототип)
+  // Перехват отправки форм
   document.addEventListener(
     "submit",
     function (e) {
@@ -71,35 +94,39 @@
       if (!form || !form.tagName || form.tagName.toLowerCase() !== "form") {
         return;
       }
+
       e.preventDefault();
 
       try {
         const formData = new FormData(form);
-        const params = new URLSearchParams();
-        formData.forEach((value, key) => {
-          params.append(key, value);
-        });
-
         const method = (form.getAttribute("method") || "GET").toUpperCase();
         const actionAttr = form.getAttribute("action");
 
-        // Базовый путь: либо action, либо текущий путь (без origin)
-        const basePath =
-          actionAttr && actionAttr.trim().length > 0
-            ? actionAttr
-            : window.location.pathname +
-              window.location.search +
-              window.location.hash;
-
-        const url = new URL(basePath, window.location.href);
-
-        // Прототип: ВСЕГДА конвертим в GET с query (даже если method=POST)
-        // Это не идеально, но работает для простых форм (поисковые и т.п.).
-        params.forEach((value, key) => {
-          url.searchParams.set(key, value);
+        // Собираем поля в объект
+        const fields = {};
+        formData.forEach((value, key) => {
+          fields[key] = value;
         });
 
-        navigateViaProxy(url.toString());
+        if (method === "GET") {
+          // Классический поиск: параметры в query
+          const basePath =
+            actionAttr && actionAttr.trim().length > 0
+              ? actionAttr
+              : window.location.pathname +
+                window.location.search +
+                window.location.hash;
+
+          const url = new URL(basePath, window.location.href);
+          Object.entries(fields).forEach(([key, value]) => {
+            url.searchParams.set(key, value);
+          });
+
+          navigateViaProxy(url.toString());
+        } else {
+          // method=POST (наш случай с капчой) — отправляем поля на /__act/submit
+          submitViaProxy(fields);
+        }
       } catch (err) {
         console.error("submit interception error", err);
       }

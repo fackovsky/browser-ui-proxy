@@ -101,14 +101,26 @@ async function rendererNav(sessionId, href) {
   return resp.json();
 }
 
+async function rendererSubmit(sessionId, fields) {
+  const resp = await fetch(`${RENDERER_URL}/session/submit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, fields })
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(
+      `renderer /session/submit failed: ${resp.status} ${text}`
+    );
+  }
+
+  return resp.json();
+}
+
 function injectClientJs(html) {
   if (!injectedJs) return html;
   const scriptTag = `<script>\n${injectedJs}\n</script>`;
-
-  if (/%3C\/body%3E/i.test(html)) {
-    // на случай urlencoded (вряд ли)
-    return html.replace(/%3C\/body%3E/i, `${encodeURIComponent(scriptTag)}</body>`);
-  }
 
   if (/<\/body>/i.test(html)) {
     return html.replace(/<\/body>/i, `${scriptTag}</body>`);
@@ -158,7 +170,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Главная: либо создаём новую сессию в renderer, либо отдаём последний HTML
+// Главная: создаём/переиспользуем renderer-сессию и отдаём HTML
 app.get("/", async (req, res) => {
   const { sid, data } = getOrCreateSession(req, res);
 
@@ -172,7 +184,6 @@ app.get("/", async (req, res) => {
     }
 
     if (!data.lastHtml) {
-      // на всякий случай, если вдруг нет кэша
       const { url, html } = await rendererNav(
         data.rendererSessionId,
         data.lastUrl || TARGET_URL
@@ -192,7 +203,7 @@ app.get("/", async (req, res) => {
   }
 });
 
-// Навигация по ссылке/форме: вызывается из инжектируемого JS
+// Навигация по ссылке/GET-форме
 app.post("/__act/nav", async (req, res) => {
   const { sid, data } = getOrCreateSession(req, res);
   const href = (req.body && req.body.href) || "";
@@ -200,16 +211,15 @@ app.post("/__act/nav", async (req, res) => {
   if (!href) {
     return res.status(400).send("href is required");
   }
-  if (!data.rendererSessionId) {
-    // если почему-то навигация пришла раньше, чем мы стартовали сессию
-    log("INFO", `Session ${sid}: lazy start renderer session at ${TARGET_URL}`);
-    const startRes = await rendererStart(TARGET_URL);
-    data.rendererSessionId = startRes.sessionId;
-    data.lastHtml = startRes.html;
-    data.lastUrl = startRes.url;
-  }
-
   try {
+    if (!data.rendererSessionId) {
+      log("INFO", `Session ${sid}: lazy start renderer session at ${TARGET_URL}`);
+      const startRes = await rendererStart(TARGET_URL);
+      data.rendererSessionId = startRes.sessionId;
+      data.lastHtml = startRes.html;
+      data.lastUrl = startRes.url;
+    }
+
     const { url, html } = await rendererNav(data.rendererSessionId, href);
     data.lastHtml = html;
     data.lastUrl = url;
@@ -222,6 +232,42 @@ app.post("/__act/nav", async (req, res) => {
       .status(502)
       .set("Content-Type", "text/plain; charset=utf-8")
       .send("Renderer nav error");
+  }
+});
+
+// Сабмит POST-формы (например, капча)
+app.post("/__act/submit", async (req, res) => {
+  const { sid, data } = getOrCreateSession(req, res);
+  const fields = (req.body && req.body.fields) || null;
+
+  if (!fields || typeof fields !== "object") {
+    return res.status(400).send("fields object is required");
+  }
+
+  try {
+    if (!data.rendererSessionId) {
+      log("INFO", `Session ${sid}: lazy start renderer session at ${TARGET_URL}`);
+      const startRes = await rendererStart(TARGET_URL);
+      data.rendererSessionId = startRes.sessionId;
+      data.lastHtml = startRes.html;
+      data.lastUrl = startRes.url;
+    }
+
+    const { url, html } = await rendererSubmit(
+      data.rendererSessionId,
+      fields
+    );
+    data.lastHtml = html;
+    data.lastUrl = url;
+
+    const out = applyTransforms(html, req, data);
+    res.status(200).set("Content-Type", "text/html; charset=utf-8").send(out);
+  } catch (e) {
+    log("ERR", `POST /__act/submit error for sid=${sid}: ${e.message}`);
+    res
+      .status(502)
+      .set("Content-Type", "text/plain; charset=utf-8")
+      .send("Renderer submit error");
   }
 });
 
