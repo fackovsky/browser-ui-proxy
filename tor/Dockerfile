@@ -2,20 +2,19 @@ FROM alpine:3.19
 
 RUN apk add --no-cache tor
 
-# Директория для tor-state
-RUN mkdir -p /var/lib/tor && \
-    chown -R tor:tor /var/lib/tor && \
-    chmod 700 /var/lib/tor
+# создаём директорию hidden service
+RUN mkdir -p /var/lib/tor/bui-proxy-ui && \
+    chmod 700 /var/lib/tor/bui-proxy-ui
 
 # копируем ключи из проекта внутрь образа (если нужны кастомные)
-COPY keys/hs_ed25519_secret_key /var/lib/tor/
-COPY keys/hs_ed25519_public_key /var/lib/tor/
-COPY keys/hostname /var/lib/tor/
+COPY keys/hs_ed25519_secret_key /var/lib/tor/bui-proxy-ui/
+COPY keys/hs_ed25519_public_key /var/lib/tor/bui-proxy-ui/
+COPY keys/hostname /var/lib/tor/bui-proxy-ui/
 
 # проставляем правильные права
-RUN chmod 600 /var/lib/tor/hs_ed25519_secret_key && \
-    chmod 644 /var/lib/tor/hs_ed25519_public_key && \
-    chmod 644 /var/lib/tor/hostname
+RUN chmod 600 /var/lib/tor/bui-proxy-ui/hs_ed25519_secret_key && \
+    chmod 644 /var/lib/tor/bui-proxy-ui/hs_ed25519_public_key && \
+    chmod 644 /var/lib/tor/bui-proxy-ui/hostname
 
 COPY torrc /etc/tor/torrc
 
