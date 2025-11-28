@@ -28,30 +28,103 @@ async function getBrowser() {
   return browser;
 }
 
-// общая функция: goto + сбор CSS + возвращение html
-async function gotoWithInlineCss(sessionId, page, targetUrl) {
-  const cssChunks = [];
+/**
+ * Вспомогалка: переписать url(...) внутри CSS на data: URI,
+ * если у нас есть содержимое картинки в imageMap.
+ */
+function rewriteCssUrls(cssText, baseUrl, imageMap) {
+  if (!cssText || typeof cssText !== "string") return cssText;
+
+  return cssText.replace(/url\(([^)]+)\)/gi, (match, p1) => {
+    let inside = p1.trim();
+    if (!inside) return match;
+
+    // сохраняем кавычки, если были
+    let quote = "";
+    const first = inside[0];
+    const last = inside[inside.length - 1];
+    if ((first === "'" || first === '"') && first === last) {
+      quote = first;
+      inside = inside.slice(1, -1).trim();
+    }
+
+    if (!inside || inside.startsWith("data:")) {
+      return match; // уже data: или пусто
+    }
+
+    let absUrl;
+    try {
+      absUrl = new URL(inside, baseUrl).toString();
+    } catch {
+      return match;
+    }
+
+    const img = imageMap.get(absUrl);
+    if (!img) {
+      return match; // для этого url нет картинки
+    }
+
+    const contentType = img.contentType || "image/*";
+    const dataUrl = `data:${contentType};base64,${img.data}`;
+    const finalUrl = quote ? `${quote}${dataUrl}${quote}` : dataUrl;
+
+    return `url(${finalUrl})`;
+  });
+}
+
+/**
+ * Общая функция: goto + сбор CSS + сбор картинок + инлайн всего этого.
+ */
+async function gotoWithInlineCssAndImages(sessionId, page, targetUrl) {
+  const cssChunks = []; // { baseUrl, text }
+  const imageMap = new Map(); // absUrl -> { contentType, data(base64) }
 
   const onResponse = async (response) => {
     try {
       const req = response.request();
+      const resUrl = response.url();
       const headers = response.headers() || {};
       const ct = (headers["content-type"] || "").toLowerCase();
+
+      const resourceType = req.resourceType();
       const isStylesheet =
-        req.resourceType() === "stylesheet" || ct.includes("text/css");
+        resourceType === "stylesheet" || ct.includes("text/css");
+      const isImage =
+        resourceType === "image" || ct.startsWith("image/");
 
       if (isStylesheet && response.ok()) {
         const text = await response.text();
         if (text && text.trim().length > 0) {
-          cssChunks.push(text);
+          cssChunks.push({ baseUrl: resUrl, text });
           log(
             "INFO",
-            `Session ${sessionId}: captured CSS from ${response.url()} (${text.length} bytes)`
+            `Session ${sessionId}: captured CSS from ${resUrl} (${text.length} bytes)`
+          );
+        }
+      } else if (isImage && response.ok()) {
+        const body = await response.body();
+        if (body && body.length > 0) {
+          let contentType = ct;
+          // Если заголовка нет, пытаемся угадать по расширению
+          if (!contentType) {
+            if (resUrl.endsWith(".png")) contentType = "image/png";
+            else if (resUrl.endsWith(".jpg") || resUrl.endsWith(".jpeg"))
+              contentType = "image/jpeg";
+            else if (resUrl.endsWith(".gif")) contentType = "image/gif";
+            else if (resUrl.endsWith(".webp")) contentType = "image/webp";
+          }
+          imageMap.set(resUrl, {
+            contentType,
+            data: body.toString("base64")
+          });
+          log(
+            "INFO",
+            `Session ${sessionId}: captured IMAGE from ${resUrl} (${body.length} bytes)`
           );
         }
       }
     } catch (e) {
-      log("ERR", `CSS capture error in session ${sessionId}: ${e.message}`);
+      log("ERR", `Response handler error in session ${sessionId}: ${e.message}`);
     }
   };
 
@@ -66,10 +139,17 @@ async function gotoWithInlineCss(sessionId, page, targetUrl) {
   const urlNow = page.url();
 
   if (cssChunks.length > 0) {
-    const inlineCss =
-      "\n/* ---- inlined styles captured by renderer ---- */\n" +
-      cssChunks.join("\n");
-    const styleTag = `<style>${inlineCss}</style>`;
+    let combinedCss =
+      "\n/* ---- inlined styles captured by renderer ---- */\n";
+    for (const chunk of cssChunks) {
+      const rewritten = rewriteCssUrls(
+        chunk.text,
+        chunk.baseUrl,
+        imageMap
+      );
+      combinedCss += rewritten + "\n";
+    }
+    const styleTag = `<style>${combinedCss}</style>`;
 
     if (/<\/head>/i.test(html)) {
       html = html.replace(/<\/head>/i, `${styleTag}</head>`);
@@ -78,7 +158,7 @@ async function gotoWithInlineCss(sessionId, page, targetUrl) {
     }
     log(
       "INFO",
-      `Session ${sessionId}: inlined ${cssChunks.length} CSS resources into HTML`
+      `Session ${sessionId}: inlined ${cssChunks.length} CSS resources (with images where possible)`
     );
   } else {
     log("INFO", `Session ${sessionId}: no CSS captured for ${targetUrl}`);
@@ -95,7 +175,11 @@ async function createSession(startUrl) {
   const sessionId = crypto.randomBytes(16).toString("hex");
   log("INFO", `New renderer session ${sessionId}: goto ${startUrl}`);
 
-  const { url, html } = await gotoWithInlineCss(sessionId, page, startUrl);
+  const { url, html } = await gotoWithInlineCssAndImages(
+    sessionId,
+    page,
+    startUrl
+  );
 
   sessions.set(sessionId, { context, page, lastUrl: url });
   log("INFO", `Session ${sessionId} created at ${url}`);
@@ -113,7 +197,11 @@ async function navSession(sessionId, href) {
   const baseUrl = lastUrl || page.url() || href;
   const targetUrl = new URL(href, baseUrl).toString();
 
-  const { url, html } = await gotoWithInlineCss(sessionId, page, targetUrl);
+  const { url, html } = await gotoWithInlineCssAndImages(
+    sessionId,
+    page,
+    targetUrl
+  );
   sess.lastUrl = url;
 
   return { url, html };
