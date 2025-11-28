@@ -1,12 +1,17 @@
-version: "3.9"
 
 services:
   tor:
     build: ./tor
     container_name: bui-tor
     restart: unless-stopped
+    networks:
+      - bui-net
     volumes:
-      - ./tor/data:/var/lib/tor
+      # ВАЖНО: здесь лежат твои готовые ключи и hostname
+      # tor/keys/hs_ed25519_secret_key
+      # tor/keys/hs_ed25519_public_key
+      # tor/keys/hostname
+      - ./tor/keys:/var/lib/tor/bui-onion-proxy
 
   renderer:
     build: ./renderer
@@ -14,8 +19,12 @@ services:
     restart: unless-stopped
     depends_on:
       - tor
+    networks:
+      - bui-net
     environment:
+      # Порт, на котором слушает renderer внутри сети Docker
       - PORT=3001
+      # Tor SOCKS-прокси — ИМЯ СЕРВИСА "tor", порт 9050
       - TOR_SOCKS=socks5://tor:9050
 
   proxy-ui:
@@ -24,10 +33,19 @@ services:
     restart: unless-stopped
     depends_on:
       - renderer
+    networks:
+      - bui-net
     environment:
-      # URL стартовой страницы, которую будет открывать Playwright
+      # Стартовый URL, который будет открывать Playwright
       - TARGET_URL=http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/
+      # Порт внутри контейнера
       - PORT=8080
+      # Адрес renderer внутри Docker-сети
       - RENDERER_URL=http://renderer:3001
     ports:
+      # Паблик-порт для локального доступа (http://localhost:8081/)
       - "8081:8080"
+
+networks:
+  bui-net:
+    driver: bridge
