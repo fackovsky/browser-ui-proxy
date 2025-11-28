@@ -28,22 +28,79 @@ async function getBrowser() {
   return browser;
 }
 
+// общая функция: goto + сбор CSS + возвращение html
+async function gotoWithInlineCss(sessionId, page, targetUrl) {
+  const cssChunks = [];
+
+  const onResponse = async (response) => {
+    try {
+      const req = response.request();
+      const headers = response.headers() || {};
+      const ct = (headers["content-type"] || "").toLowerCase();
+      const isStylesheet =
+        req.resourceType() === "stylesheet" || ct.includes("text/css");
+
+      if (isStylesheet && response.ok()) {
+        const text = await response.text();
+        if (text && text.trim().length > 0) {
+          cssChunks.push(text);
+          log(
+            "INFO",
+            `Session ${sessionId}: captured CSS from ${response.url()} (${text.length} bytes)`
+          );
+        }
+      }
+    } catch (e) {
+      log("ERR", `CSS capture error in session ${sessionId}: ${e.message}`);
+    }
+  };
+
+  page.on("response", onResponse);
+
+  log("INFO", `Session ${sessionId}: goto ${targetUrl}`);
+  await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 60000 });
+
+  page.off("response", onResponse);
+
+  let html = await page.content();
+  const urlNow = page.url();
+
+  if (cssChunks.length > 0) {
+    const inlineCss =
+      "\n/* ---- inlined styles captured by renderer ---- */\n" +
+      cssChunks.join("\n");
+    const styleTag = `<style>${inlineCss}</style>`;
+
+    if (/<\/head>/i.test(html)) {
+      html = html.replace(/<\/head>/i, `${styleTag}</head>`);
+    } else {
+      html = styleTag + html;
+    }
+    log(
+      "INFO",
+      `Session ${sessionId}: inlined ${cssChunks.length} CSS resources into HTML`
+    );
+  } else {
+    log("INFO", `Session ${sessionId}: no CSS captured for ${targetUrl}`);
+  }
+
+  return { url: urlNow, html };
+}
+
 async function createSession(startUrl) {
   const br = await getBrowser();
   const context = await br.newContext();
   const page = await context.newPage();
 
-  log("INFO", `New renderer session: goto ${startUrl}`);
-  await page.goto(startUrl, { waitUntil: "networkidle", timeout: 60000 });
-
   const sessionId = crypto.randomBytes(16).toString("hex");
-  const lastUrl = page.url();
+  log("INFO", `New renderer session ${sessionId}: goto ${startUrl}`);
 
-  sessions.set(sessionId, { context, page, lastUrl });
-  log("INFO", `Session ${sessionId} created at ${lastUrl}`);
+  const { url, html } = await gotoWithInlineCss(sessionId, page, startUrl);
 
-  const html = await page.content();
-  return { sessionId, url: lastUrl, html };
+  sessions.set(sessionId, { context, page, lastUrl: url });
+  log("INFO", `Session ${sessionId} created at ${url}`);
+
+  return { sessionId, url, html };
 }
 
 async function navSession(sessionId, href) {
@@ -52,18 +109,14 @@ async function navSession(sessionId, href) {
     throw new Error(`Unknown sessionId: ${sessionId}`);
   }
 
-  const { page } = sess;
-  const baseUrl = page.url() || href;
+  const { page, lastUrl } = sess;
+  const baseUrl = lastUrl || page.url() || href;
   const targetUrl = new URL(href, baseUrl).toString();
 
-  log("INFO", `Session ${sessionId} nav to ${targetUrl}`);
-  await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 60000 });
+  const { url, html } = await gotoWithInlineCss(sessionId, page, targetUrl);
+  sess.lastUrl = url;
 
-  const html = await page.content();
-  const urlNow = page.url();
-  sess.lastUrl = urlNow;
-
-  return { url: urlNow, html };
+  return { url, html };
 }
 
 // --- Express server ---
@@ -91,7 +144,9 @@ app.post("/session/start", async (req, res) => {
 app.post("/session/nav", async (req, res) => {
   const { sessionId, href } = req.body || {};
   if (!sessionId || !href) {
-    return res.status(400).json({ error: "sessionId and href are required" });
+    return res
+      .status(400)
+      .json({ error: "sessionId and href are required" });
   }
 
   try {
