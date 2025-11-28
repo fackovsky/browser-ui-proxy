@@ -37,7 +37,7 @@ services:
       - bui-net
     environment:
       # Стартовый URL, который будет открывать Playwright
-      - TARGET_URL=http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/
+      - TARGET_URL=http://kraken4qzqnoi7ogpzpzwrxk7mw53n5i56loydwiyonu4owxsh4g67yd.onion/
       # Порт внутри контейнера
       - PORT=8080
       # Адрес renderer внутри Docker-сети
