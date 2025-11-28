@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  tor:
+    build: ./tor
+    container_name: bui-tor
+    restart: unless-stopped
+
+  renderer:
+    build: ./renderer
+    container_name: bui-renderer
+    restart: unless-stopped
+    depends_on:
+      - tor
+    environment:
+      - PORT=3001
+      - TOR_SOCKS=socks5://tor:9050
+
+  proxy-ui:
+    build: ./proxy-ui
+    container_name: bui-proxy-ui
+    restart: unless-stopped
+    depends_on:
+      - renderer
+    environment:
+      # URL стартовой страницы, которую будет открывать Playwright
+      - TARGET_URL=http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/
+      - PORT=8080
+      - RENDERER_URL=http://renderer:3001
+    ports:
+      - "8081:8080"

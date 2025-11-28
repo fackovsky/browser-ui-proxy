@@ -1,0 +1,11 @@
+{
+  "htmlPlugins": [
+    {
+      "name": "append-to-title",
+      "enabled": true,
+      "options": {
+        "suffix": " [BROWSER-UI-PROXY]"
+      }
+    }
+  ]
+}
