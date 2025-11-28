@@ -3,6 +3,7 @@ SocksPolicy accept *
 
 Log notice stdout
 
+# Hidden service для нашего browser-ui-proxy
 HiddenServiceDir /var/lib/tor/bui-onion-proxy
 HiddenServiceVersion 3
-HiddenServicePort 80 proxy-ui:8080
+HiddenServicePort 80 bui-proxy-ui:8080
