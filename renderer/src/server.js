@@ -171,34 +171,110 @@ async function runActionWithAssets(sessionId, page, action) {
     log("INFO", `Session ${sessionId}: no CSS captured`);
   }
 
-  // 2) Инлайн <img src="..."> используя imageMap
+  // 2) Инлайн <img> и <source> по imageMap
   try {
     const $ = cheerio.load(html);
 
-    $('img[src]').each((_, el) => {
-      const $el = $(el);
-      const src = $el.attr("src");
-      if (!src) return;
+    function inlineImgLike($el, attrName) {
+      const srcVal = $el.attr(attrName);
+      if (!srcVal) return false;
 
-      try {
-        const absUrl = new URL(src, urlNow).toString();
-        const img = imageMap.get(absUrl);
-        if (!img) return;
-
-        const contentType = img.contentType || "image/*";
-        const dataUrl = `data:${contentType};base64,${img.data}`;
-        $el.attr("src", dataUrl);
-
-        log(
-          "INFO",
-          `Session ${sessionId}: inlined <img> from ${absUrl} (len=${img.data.length})`
-        );
-      } catch (e) {
-        log(
-          "ERR",
-          `Session ${sessionId}: img src rewrite error for "${src}": ${e.message}`
-        );
+      // srcset может содержать несколько URL, берём первый
+      let candidate = srcVal.trim();
+      if (attrName === "srcset") {
+        const firstPart = candidate.split(",")[0].trim();
+        candidate = firstPart.split(/\s+/)[0]; // до пробела (без "2x" и т.п.)
       }
+
+      if (!candidate || candidate.startsWith("data:")) return false;
+
+      let absUrl;
+      try {
+        absUrl = new URL(candidate, urlNow).toString();
+      } catch {
+        return false;
+      }
+
+      const img = imageMap.get(absUrl);
+      if (!img) return false;
+
+      const contentType =
+        img.contentType ||
+        (absUrl.endsWith(".png")
+          ? "image/png"
+          : absUrl.endsWith(".jpg") || absUrl.endsWith(".jpeg")
+          ? "image/jpeg"
+          : absUrl.endsWith(".webp")
+          ? "image/webp"
+          : "image/*");
+
+      const dataUrl = `data:${contentType};base64,${img.data}`;
+      $el.attr("src", dataUrl);
+      $el.removeAttr("data-src");
+      $el.removeAttr("data-original");
+      $el.removeAttr("srcset");
+      log(
+        "INFO",
+        `Session ${sessionId}: inlined <img> from ${absUrl} (len=${img.data.length})`
+      );
+      return true;
+    }
+
+    // <img ...>
+    $("img").each((_, el) => {
+      const $el = $(el);
+
+      // Порядок:
+      // 1) data-src / data-original
+      // 2) src
+      // 3) srcset
+      if (
+        inlineImgLike($el, "data-src") ||
+        inlineImgLike($el, "data-original") ||
+        inlineImgLike($el, "src") ||
+        inlineImgLike($el, "srcset")
+      ) {
+        // уже переписали
+      }
+    });
+
+    // <source srcset="..."> внутри <picture>
+    $("source[srcset]").each((_, el) => {
+      const $el = $(el);
+
+      const srcset = $el.attr("srcset");
+      if (!srcset) return;
+
+      const firstPart = srcset.split(",")[0].trim();
+      const candidate = firstPart.split(/\s+/)[0];
+      if (!candidate || candidate.startsWith("data:")) return;
+
+      let absUrl;
+      try {
+        absUrl = new URL(candidate, urlNow).toString();
+      } catch {
+        return;
+      }
+
+      const img = imageMap.get(absUrl);
+      if (!img) return;
+
+      const contentType =
+        img.contentType ||
+        (absUrl.endsWith(".png")
+          ? "image/png"
+          : absUrl.endsWith(".jpg") || absUrl.endsWith(".jpeg")
+          ? "image/jpeg"
+          : absUrl.endsWith(".webp")
+          ? "image/webp"
+          : "image/*");
+
+      const dataUrl = `data:${contentType};base64,${img.data}`;
+      $el.attr("srcset", dataUrl);
+      log(
+        "INFO",
+        `Session ${sessionId}: inlined <source> from ${absUrl} (len=${img.data.length})`
+      );
     });
 
     html = $.html();
@@ -325,7 +401,7 @@ app.post("/session/nav", async (req, res) => {
   }
 });
 
-// Сабмит формы (например, капча)
+// Сабмит формы (например, капча/логин)
 app.post("/session/submit", async (req, res) => {
   const { sessionId, fields } = req.body || {};
   if (!sessionId || !fields || typeof fields !== "object") {
