@@ -2,6 +2,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const { chromium } = require("playwright");
+const cheerio = require("cheerio");
 
 const PORT = process.env.PORT || 3001;
 const TOR_SOCKS = process.env.TOR_SOCKS || ""; // например: socks5://tor:9050
@@ -38,7 +39,6 @@ function rewriteCssUrls(cssText, baseUrl, imageMap) {
     let inside = p1.trim();
     if (!inside) return match;
 
-    // сохраняем кавычки
     let quote = "";
     const first = inside[0];
     const last = inside[inside.length - 1];
@@ -48,7 +48,7 @@ function rewriteCssUrls(cssText, baseUrl, imageMap) {
     }
 
     if (!inside || inside.startsWith("data:")) {
-      return match; // уже data: или пусто
+      return match;
     }
 
     let absUrl;
@@ -73,7 +73,7 @@ function rewriteCssUrls(cssText, baseUrl, imageMap) {
 
 /**
  * Общая функция: выполнить действие (goto или form.submit),
- * параллельно собирать CSS и картинки, и вернуть HTML с инлайном.
+ * параллельно собрать CSS и картинки, и вернуть HTML с инлайном.
  */
 async function runActionWithAssets(sessionId, page, action) {
   const cssChunks = []; // { baseUrl, text }
@@ -144,6 +144,7 @@ async function runActionWithAssets(sessionId, page, action) {
   let html = await page.content();
   const urlNow = page.url();
 
+  // 1) Инлайн CSS с переписанными url(...)
   if (cssChunks.length > 0) {
     let combinedCss =
       "\n/* ---- inlined styles captured by renderer ---- */\n";
@@ -168,6 +169,41 @@ async function runActionWithAssets(sessionId, page, action) {
     );
   } else {
     log("INFO", `Session ${sessionId}: no CSS captured`);
+  }
+
+  // 2) Инлайн <img src="..."> используя imageMap
+  try {
+    const $ = cheerio.load(html);
+
+    $('img[src]').each((_, el) => {
+      const $el = $(el);
+      const src = $el.attr("src");
+      if (!src) return;
+
+      try {
+        const absUrl = new URL(src, urlNow).toString();
+        const img = imageMap.get(absUrl);
+        if (!img) return;
+
+        const contentType = img.contentType || "image/*";
+        const dataUrl = `data:${contentType};base64,${img.data}`;
+        $el.attr("src", dataUrl);
+
+        log(
+          "INFO",
+          `Session ${sessionId}: inlined <img> from ${absUrl} (len=${img.data.length})`
+        );
+      } catch (e) {
+        log(
+          "ERR",
+          `Session ${sessionId}: img src rewrite error for "${src}": ${e.message}`
+        );
+      }
+    });
+
+    html = $.html();
+  } catch (e) {
+    log("ERR", `Session ${sessionId}: cheerio HTML rewrite error: ${e.message}`);
   }
 
   return { url: urlNow, html };
