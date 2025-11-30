@@ -72,10 +72,79 @@ function rewriteCssUrls(cssText, baseUrl, imageMap) {
 }
 
 /**
- * Инлайним CSS и <img/src|data-src|srcset|source> поверх HTML.
+ * Общая функция: выполнить действие (goto или form.submit),
+ * параллельно собрать CSS и картинки, и вернуть HTML с инлайном.
  */
-function inlineAssets(html, urlNow, cssChunks, imageMap, sessionId) {
-  // 1) CSS
+async function runActionWithAssets(sessionId, page, action) {
+  const cssChunks = []; // { baseUrl, text }
+  const imageMap = new Map(); // absUrl -> { contentType, data(base64) }
+
+  const onResponse = async (response) => {
+    try {
+      const req = response.request();
+      const resUrl = response.url();
+      const headers = response.headers() || {};
+      const ct = (headers["content-type"] || "").toLowerCase();
+
+      const resourceType = req.resourceType();
+      const isStylesheet =
+        resourceType === "stylesheet" || ct.includes("text/css");
+      const isImage =
+        resourceType === "image" || ct.startsWith("image/");
+
+      if (isStylesheet && response.ok()) {
+        const text = await response.text();
+        if (text && text.trim().length > 0) {
+          cssChunks.push({ baseUrl: resUrl, text });
+          log(
+            "INFO",
+            `Session ${sessionId}: captured CSS from ${resUrl} (${text.length} bytes)`
+          );
+        }
+      } else if (isImage && response.ok()) {
+        const body = await response.body();
+        if (body && body.length > 0) {
+          let contentType = ct;
+          if (!contentType) {
+            if (resUrl.endsWith(".png")) contentType = "image/png";
+            else if (resUrl.endsWith(".jpg") || resUrl.endsWith(".jpeg"))
+              contentType = "image/jpeg";
+            else if (resUrl.endsWith(".gif")) contentType = "image/gif";
+            else if (resUrl.endsWith(".webp")) contentType = "image/webp";
+          }
+          imageMap.set(resUrl, {
+            contentType,
+            data: body.toString("base64")
+          });
+          log(
+            "INFO",
+            `Session ${sessionId}: captured IMAGE from ${resUrl} (${body.length} bytes)`
+          );
+        }
+      }
+    } catch (e) {
+      log("ERR", `Response handler error in session ${sessionId}: ${e.message}`);
+    }
+  };
+
+  page.on("response", onResponse);
+
+  try {
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "networkidle", timeout: 60000 }),
+      action()
+    ]);
+  } catch (e) {
+    page.off("response", onResponse);
+    throw e;
+  }
+
+  page.off("response", onResponse);
+
+  let html = await page.content();
+  const urlNow = page.url();
+
+  // 1) Инлайн CSS с переписанными url(...)
   if (cssChunks.length > 0) {
     let combinedCss =
       "\n/* ---- inlined styles captured by renderer ---- */\n";
@@ -102,7 +171,7 @@ function inlineAssets(html, urlNow, cssChunks, imageMap, sessionId) {
     log("INFO", `Session ${sessionId}: no CSS captured`);
   }
 
-  // 2) <img> и <source srcset> → data:
+  // 2) Инлайн <img> и <source> по imageMap
   try {
     const $ = cheerio.load(html);
 
@@ -213,93 +282,6 @@ function inlineAssets(html, urlNow, cssChunks, imageMap, sessionId) {
     log("ERR", `Session ${sessionId}: cheerio HTML rewrite error: ${e.message}`);
   }
 
-  return html;
-}
-
-/**
- * Общий helper: вешаем page.on('response'), выполняем action(),
- * по желанию мягко ждём networkidle, снимаем HTML и инлайним всё.
- *
- * options:
- *   - expectIdle: ждать networkidle после action (submit/form и т.п.)
- */
-async function runActionWithAssets(sessionId, page, action, options = {}) {
-  const { expectIdle = false } = options;
-
-  const cssChunks = []; // { baseUrl, text }
-  const imageMap = new Map(); // absUrl -> { contentType, data(base64) }
-
-  const onResponse = async (response) => {
-    try {
-      const req = response.request();
-      const resUrl = response.url();
-      const headers = response.headers() || {};
-      const ct = (headers["content-type"] || "").toLowerCase();
-
-      const resourceType = req.resourceType();
-      const isStylesheet =
-        resourceType === "stylesheet" || ct.includes("text/css");
-      const isImage =
-        resourceType === "image" || ct.startsWith("image/");
-
-      if (isStylesheet && response.ok()) {
-        const text = await response.text();
-        if (text && text.trim().length > 0) {
-          cssChunks.push({ baseUrl: resUrl, text });
-          log(
-            "INFO",
-            `Session ${sessionId}: captured CSS from ${resUrl} (${text.length} bytes)`
-          );
-        }
-      } else if (isImage && response.ok()) {
-        const body = await response.body();
-        if (body && body.length > 0) {
-          let contentType = ct;
-          if (!contentType) {
-            if (resUrl.endsWith(".png")) contentType = "image/png";
-            else if (resUrl.endsWith(".jpg") || resUrl.endsWith(".jpeg"))
-              contentType = "image/jpeg";
-            else if (resUrl.endsWith(".gif")) contentType = "image/gif";
-            else if (resUrl.endsWith(".webp")) contentType = "image/webp";
-          }
-          imageMap.set(resUrl, {
-            contentType,
-            data: body.toString("base64")
-          });
-          log(
-            "INFO",
-            `Session ${sessionId}: captured IMAGE from ${resUrl} (${body.length} bytes)`
-          );
-        }
-      }
-    } catch (e) {
-      log("ERR", `Response handler error in session ${sessionId}: ${e.message}`);
-    }
-  };
-
-  page.on("response", onResponse);
-
-  try {
-    await action();
-
-    if (expectIdle) {
-      try {
-        await page.waitForLoadState("networkidle", { timeout: 10000 });
-      } catch (e) {
-        log(
-          "WARN",
-          `Session ${sessionId}: waitForLoadState(networkidle) timeout/err: ${e.message}`
-        );
-      }
-    }
-  } finally {
-    page.off("response", onResponse);
-  }
-
-  const htmlRaw = await page.content();
-  const urlNow = page.url();
-  const html = inlineAssets(htmlRaw, urlNow, cssChunks, imageMap, sessionId);
-
   return { url: urlNow, html };
 }
 
@@ -311,15 +293,8 @@ async function createSession(startUrl) {
   const sessionId = crypto.randomBytes(16).toString("hex");
   log("INFO", `New renderer session ${sessionId}: goto ${startUrl}`);
 
-  const { url, html } = await runActionWithAssets(
-    sessionId,
-    page,
-    () =>
-      page.goto(startUrl, {
-        waitUntil: "load",
-        timeout: 120000
-      }),
-    { expectIdle: false }
+  const { url, html } = await runActionWithAssets(sessionId, page, () =>
+    page.goto(startUrl)
   );
 
   sessions.set(sessionId, { context, page, lastUrl: url });
@@ -340,15 +315,8 @@ async function navSession(sessionId, href) {
 
   log("INFO", `Session ${sessionId}: nav to ${targetUrl}`);
 
-  const { url, html } = await runActionWithAssets(
-    sessionId,
-    page,
-    () =>
-      page.goto(targetUrl, {
-        waitUntil: "load",
-        timeout: 120000
-      }),
-    { expectIdle: false }
+  const { url, html } = await runActionWithAssets(sessionId, page, () =>
+    page.goto(targetUrl)
   );
   sess.lastUrl = url;
 
@@ -364,13 +332,11 @@ async function submitSession(sessionId, fields) {
   const { page, lastUrl } = sess;
   log("INFO", `Session ${sessionId}: submit form on ${lastUrl || page.url()}`);
 
-  // НЕ кидаем ошибку, если формы нет — просто вернём текущий снапшот.
-  const action = async () => {
-    const didSubmit = await page.evaluate((fields) => {
+  const action = () =>
+    page.evaluate((fields) => {
       const form = document.querySelector("form");
       if (!form) {
-        console.warn("No <form> found on the page");
-        return false;
+        throw new Error("No <form> found on the page");
       }
 
       for (const [name, value] of Object.entries(fields)) {
@@ -384,21 +350,9 @@ async function submitSession(sessionId, fields) {
       }
 
       form.submit();
-      return true;
     }, fields);
 
-    if (!didSubmit) {
-      log(
-        "INFO",
-        `Session ${sessionId}: submit called, but no <form> found; returning current HTML`
-      );
-    }
-  };
-
-  // После submit мягко ждём networkidle, но НЕ падаем по таймауту
-  const { url, html } = await runActionWithAssets(sessionId, page, action, {
-    expectIdle: true
-  });
+  const { url, html } = await runActionWithAssets(sessionId, page, action);
   sess.lastUrl = url;
 
   return { url, html };
@@ -447,7 +401,7 @@ app.post("/session/nav", async (req, res) => {
   }
 });
 
-// Сабмит формы (капча/логин и т.п.)
+// Сабмит формы (например, капча/логин)
 app.post("/session/submit", async (req, res) => {
   const { sessionId, fields } = req.body || {};
   if (!sessionId || !fields || typeof fields !== "object") {
