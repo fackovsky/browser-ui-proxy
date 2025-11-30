@@ -15,55 +15,34 @@
     }
   }
 
-  async function navigateViaProxy(href) {
+  // --- навигация через полноценный переход страницы ---
+
+  function navFullPage(href) {
     const rel = toProxyRelative(href);
-
-    try {
-      const resp = await fetch("/__act/nav", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ href: rel })
-      });
-
-      if (!resp.ok) {
-        console.error("Proxy nav failed with status", resp.status);
-        return;
-      }
-
-      const html = await resp.text();
-      document.open();
-      document.write(html);
-      document.close();
-    } catch (e) {
-      console.error("Proxy nav error", e);
-    }
+    // идём на наш спец-эндпоинт, который отдаёт уже готовый HTML
+    const url = "/__act/nav?href=" + encodeURIComponent(rel);
+    window.location.href = url;
   }
 
-  async function submitViaProxy(fields) {
-    try {
-      const resp = await fetch("/__act/submit", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ fields })
-      });
+  function submitFullPage(fields) {
+    // отправляем форму на /__act/submit обычным POST-запросом
+    const form = document.createElement("form");
+    form.method = "POST";
+    form.action = "/__act/submit";
 
-      if (!resp.ok) {
-        console.error("Proxy submit failed with status", resp.status);
-        return;
-      }
+    Object.entries(fields).forEach(([key, value]) => {
+      const input = document.createElement("input");
+      input.type = "hidden";
+      input.name = key;
+      input.value = value;
+      form.appendChild(input);
+    });
 
-      const html = await resp.text();
-      document.open();
-      document.write(html);
-      document.close();
-    } catch (e) {
-      console.error("Proxy submit error", e);
-    }
+    document.body.appendChild(form);
+    form.submit();
   }
+
+  // --- перехват событий ---
 
   // Перехват кликов по ссылкам
   document.addEventListener(
@@ -81,7 +60,7 @@
       if (href.toLowerCase().startsWith("javascript:")) return;
 
       e.preventDefault();
-      navigateViaProxy(href);
+      navFullPage(href);
     },
     true
   );
@@ -109,7 +88,6 @@
         });
 
         if (method === "GET") {
-          // Классический поиск: параметры в query
           const basePath =
             actionAttr && actionAttr.trim().length > 0
               ? actionAttr
@@ -122,10 +100,10 @@
             url.searchParams.set(key, value);
           });
 
-          navigateViaProxy(url.toString());
+          navFullPage(url.toString());
         } else {
-          // method=POST (наш случай с капчой) — отправляем поля на /__act/submit
-          submitViaProxy(fields);
+          // method=POST (капчи, логин, walkthrough)
+          submitFullPage(fields);
         }
       } catch (err) {
         console.error("submit interception error", err);
@@ -147,7 +125,7 @@
       badge.style.color = "#fff";
       badge.style.padding = "4px 8px";
       badge.style.borderRadius = "4px";
-      badge.style.zIndex = "999999";
+      badge.style.zIndex = "999998";
       badge.style.pointerEvents = "none";
       document.body.appendChild(badge);
     } catch (e) {
