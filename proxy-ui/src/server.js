@@ -130,7 +130,7 @@ function injectClientJs(html) {
 
 function applyTransforms(html, req, session) {
   const ctx = {
-    config: {}, // можно добавить общие настройки плагинов
+    config: {}, // пока ничего особенного
     session,
     logger: {
       info: (m) => log("INFO", m),
@@ -163,7 +163,6 @@ function applyTransforms(html, req, session) {
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: false })); // для обычных form POST
 
 // лог запросов
 app.use((req, res, next) => {
@@ -204,15 +203,14 @@ app.get("/", async (req, res) => {
   }
 });
 
-// Навигация по ссылке/GET-форме: full-page переход через /__act/nav
-app.get("/__act/nav", async (req, res) => {
+// Навигация по ссылке/GET-форме
+app.post("/__act/nav", async (req, res) => {
   const { sid, data } = getOrCreateSession(req, res);
-  const href = req.query.href || "";
+  const href = (req.body && req.body.href) || "";
 
   if (!href) {
     return res.status(400).send("href is required");
   }
-
   try {
     if (!data.rendererSessionId) {
       log("INFO", `Session ${sid}: lazy start renderer session at ${TARGET_URL}`);
@@ -229,7 +227,7 @@ app.get("/__act/nav", async (req, res) => {
     const out = applyTransforms(html, req, data);
     res.status(200).set("Content-Type", "text/html; charset=utf-8").send(out);
   } catch (e) {
-    log("ERR", `GET /__act/nav error for sid=${sid}: ${e.message}`);
+    log("ERR", `POST /__act/nav error for sid=${sid}: ${e.message}`);
     res
       .status(502)
       .set("Content-Type", "text/plain; charset=utf-8")
@@ -237,20 +235,10 @@ app.get("/__act/nav", async (req, res) => {
   }
 });
 
-// Сабмит POST-формы (например, капча/логин/walkthrough)
+// Сабмит POST-формы (например, капча)
 app.post("/__act/submit", async (req, res) => {
   const { sid, data } = getOrCreateSession(req, res);
-
-  // Поддерживаем две схемы:
-  // 1) Наш старый JSON { fields: {...} }
-  // 2) Обычный form POST (application/x-www-form-urlencoded)
-  let fields = null;
-
-  if (req.is("application/json")) {
-    fields = (req.body && req.body.fields) || null;
-  } else {
-    fields = req.body || null;
-  }
+  const fields = (req.body && req.body.fields) || null;
 
   if (!fields || typeof fields !== "object") {
     return res.status(400).send("fields object is required");
