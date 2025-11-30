@@ -72,154 +72,12 @@ function rewriteCssUrls(cssText, baseUrl, imageMap) {
 }
 
 /**
- * Инлайним CSS и <img/src|data-src|srcset|source> поверх HTML.
+ * Общая функция: выполнить действие (goto или form.submit),
+ * параллельно собрать CSS и картинки, и вернуть HTML с инлайном.
  */
-function inlineAssets(html, urlNow, cssChunks, imageMap, sessionId) {
-  // 1) CSS
-  if (cssChunks.length > 0) {
-    let combinedCss =
-      "\n/* ---- inlined styles captured by renderer ---- */\n";
-    for (const chunk of cssChunks) {
-      const rewritten = rewriteCssUrls(
-        chunk.text,
-        chunk.baseUrl,
-        imageMap
-      );
-      combinedCss += rewritten + "\n";
-    }
-    const styleTag = `<style>${combinedCss}</style>`;
-
-    if (/<\/head>/i.test(html)) {
-      html = html.replace(/<\/head>/i, `${styleTag}</head>`);
-    } else {
-      html = styleTag + html;
-    }
-    log(
-      "INFO",
-      `Session ${sessionId}: inlined ${cssChunks.length} CSS resources (with images where possible)`
-    );
-  } else {
-    log("INFO", `Session ${sessionId}: no CSS captured`);
-  }
-
-  // 2) <img> и <source srcset> → data:
-  try {
-    const $ = cheerio.load(html);
-
-    function inlineImgLike($el, attrName) {
-      const srcVal = $el.attr(attrName);
-      if (!srcVal) return false;
-
-      // srcset может содержать несколько URL, берём первый
-      let candidate = srcVal.trim();
-      if (attrName === "srcset") {
-        const firstPart = candidate.split(",")[0].trim();
-        candidate = firstPart.split(/\s+/)[0]; // до пробела (без "2x" и т.п.)
-      }
-
-      if (!candidate || candidate.startsWith("data:")) return false;
-
-      let absUrl;
-      try {
-        absUrl = new URL(candidate, urlNow).toString();
-      } catch {
-        return false;
-      }
-
-      const img = imageMap.get(absUrl);
-      if (!img) return false;
-
-      const contentType =
-        img.contentType ||
-        (absUrl.endsWith(".png")
-          ? "image/png"
-          : absUrl.endsWith(".jpg") || absUrl.endsWith(".jpeg")
-          ? "image/jpeg"
-          : absUrl.endsWith(".webp")
-          ? "image/webp"
-          : "image/*");
-
-      const dataUrl = `data:${contentType};base64,${img.data}`;
-      $el.attr("src", dataUrl);
-      $el.removeAttr("data-src");
-      $el.removeAttr("data-original");
-      $el.removeAttr("srcset");
-      log(
-        "INFO",
-        `Session ${sessionId}: inlined <img> from ${absUrl} (len=${img.data.length})`
-      );
-      return true;
-    }
-
-    $("img").each((_, el) => {
-      const $el = $(el);
-
-      if (
-        inlineImgLike($el, "data-src") ||
-        inlineImgLike($el, "data-original") ||
-        inlineImgLike($el, "src") ||
-        inlineImgLike($el, "srcset")
-      ) {
-        // ок
-      }
-    });
-
-    $("source[srcset]").each((_, el) => {
-      const $el = $(el);
-      const srcset = $el.attr("srcset");
-      if (!srcset) return;
-
-      const firstPart = srcset.split(",")[0].trim();
-      const candidate = firstPart.split(/\s+/)[0];
-      if (!candidate || candidate.startsWith("data:")) return;
-
-      let absUrl;
-      try {
-        absUrl = new URL(candidate, urlNow).toString();
-      } catch {
-        return;
-      }
-
-      const img = imageMap.get(absUrl);
-      if (!img) return;
-
-      const contentType =
-        img.contentType ||
-        (absUrl.endsWith(".png")
-          ? "image/png"
-          : absUrl.endsWith(".jpg") || absUrl.endsWith(".jpeg")
-          ? "image/jpeg"
-          : absUrl.endsWith(".webp")
-          ? "image/webp"
-          : "image/*");
-
-      const dataUrl = `data:${contentType};base64,${img.data}`;
-      $el.attr("srcset", dataUrl);
-      log(
-        "INFO",
-        `Session ${sessionId}: inlined <source> from ${absUrl} (len=${img.data.length})`
-      );
-    });
-
-    html = $.html();
-  } catch (e) {
-    log("ERR", `Session ${sessionId}: cheerio HTML rewrite error: ${e.message}`);
-  }
-
-  return html;
-}
-
-/**
- * Общий helper: вешаем page.on('response'), выполняем action(),
- * опционально ждём networkidle, снимаем HTML и инлайним всё.
- *
- * requireIdle:
- *   - для goto можно не ставить (page.goto сам ждёт по waitUntil)
- *   - для submit полезно чуть подождать networkidle, но НЕ падать по таймауту
- */
-async function capturePageAssets(sessionId, page, action, { requireIdle }) {
-  const cssChunks = [];
-  const imageMap = new Map();
+async function runActionWithAssets(sessionId, page, action) {
+  const cssChunks = []; // { baseUrl, text }
+  const imageMap = new Map(); // absUrl -> { contentType, data(base64) }
 
   const onResponse = async (response) => {
     try {
@@ -272,25 +130,157 @@ async function capturePageAssets(sessionId, page, action, { requireIdle }) {
   page.on("response", onResponse);
 
   try {
-    await action();
-
-    if (requireIdle) {
-      try {
-        await page.waitForLoadState("networkidle", { timeout: 10000 });
-      } catch (e) {
-        log(
-          "WARN",
-          `Session ${sessionId}: waitForLoadState(networkidle) timeout/err: ${e.message}`
-        );
-      }
-    }
-  } finally {
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "networkidle", timeout: 60000 }),
+      action()
+    ]);
+  } catch (e) {
     page.off("response", onResponse);
+    throw e;
   }
 
-  const htmlRaw = await page.content();
+  page.off("response", onResponse);
+
+  let html = await page.content();
   const urlNow = page.url();
-  const html = inlineAssets(htmlRaw, urlNow, cssChunks, imageMap, sessionId);
+
+  // 1) Инлайн CSS с переписанными url(...)
+  if (cssChunks.length > 0) {
+    let combinedCss =
+      "\n/* ---- inlined styles captured by renderer ---- */\n";
+    for (const chunk of cssChunks) {
+      const rewritten = rewriteCssUrls(
+        chunk.text,
+        chunk.baseUrl,
+        imageMap
+      );
+      combinedCss += rewritten + "\n";
+    }
+    const styleTag = `<style>${combinedCss}</style>`;
+
+    if (/<\/head>/i.test(html)) {
+      html = html.replace(/<\/head>/i, `${styleTag}</head>`);
+    } else {
+      html = styleTag + html;
+    }
+    log(
+      "INFO",
+      `Session ${sessionId}: inlined ${cssChunks.length} CSS resources (with images where possible)`
+    );
+  } else {
+    log("INFO", `Session ${sessionId}: no CSS captured`);
+  }
+
+  // 2) Инлайн <img> и <source> по imageMap
+  try {
+    const $ = cheerio.load(html);
+
+    function inlineImgLike($el, attrName) {
+      const srcVal = $el.attr(attrName);
+      if (!srcVal) return false;
+
+      // srcset может содержать несколько URL, берём первый
+      let candidate = srcVal.trim();
+      if (attrName === "srcset") {
+        const firstPart = candidate.split(",")[0].trim();
+        candidate = firstPart.split(/\s+/)[0]; // до пробела (без "2x" и т.п.)
+      }
+
+      if (!candidate || candidate.startsWith("data:")) return false;
+
+      let absUrl;
+      try {
+        absUrl = new URL(candidate, urlNow).toString();
+      } catch {
+        return false;
+      }
+
+      const img = imageMap.get(absUrl);
+      if (!img) return false;
+
+      const contentType =
+        img.contentType ||
+        (absUrl.endsWith(".png")
+          ? "image/png"
+          : absUrl.endsWith(".jpg") || absUrl.endsWith(".jpeg")
+          ? "image/jpeg"
+          : absUrl.endsWith(".webp")
+          ? "image/webp"
+          : "image/*");
+
+      const dataUrl = `data:${contentType};base64,${img.data}`;
+      $el.attr("src", dataUrl);
+      $el.removeAttr("data-src");
+      $el.removeAttr("data-original");
+      $el.removeAttr("srcset");
+      log(
+        "INFO",
+        `Session ${sessionId}: inlined <img> from ${absUrl} (len=${img.data.length})`
+      );
+      return true;
+    }
+
+    // <img ...>
+    $("img").each((_, el) => {
+      const $el = $(el);
+
+      // Порядок:
+      // 1) data-src / data-original
+      // 2) src
+      // 3) srcset
+      if (
+        inlineImgLike($el, "data-src") ||
+        inlineImgLike($el, "data-original") ||
+        inlineImgLike($el, "src") ||
+        inlineImgLike($el, "srcset")
+      ) {
+        // уже переписали
+      }
+    });
+
+    // <source srcset="..."> внутри <picture>
+    $("source[srcset]").each((_, el) => {
+      const $el = $(el);
+
+      const srcset = $el.attr("srcset");
+      if (!srcset) return;
+
+      const firstPart = srcset.split(",")[0].trim();
+      const candidate = firstPart.split(/\s+/)[0];
+      if (!candidate || candidate.startsWith("data:")) return;
+
+      let absUrl;
+      try {
+        absUrl = new URL(candidate, urlNow).toString();
+      } catch {
+        return;
+      }
+
+      const img = imageMap.get(absUrl);
+      if (!img) return;
+
+      const contentType =
+        img.contentType ||
+        (absUrl.endsWith(".png")
+          ? "image/png"
+          : absUrl.endsWith(".jpg") || absUrl.endsWith(".jpeg")
+          ? "image/jpeg"
+          : absUrl.endsWith(".webp")
+          ? "image/webp"
+          : "image/*");
+
+      const dataUrl = `data:${contentType};base64,${img.data}`;
+      $el.attr("srcset", dataUrl);
+      log(
+        "INFO",
+        `Session ${sessionId}: inlined <source> from ${absUrl} (len=${img.data.length})`
+      );
+    });
+
+    html = $.html();
+  } catch (e) {
+    log("ERR", `Session ${sessionId}: cheerio HTML rewrite error: ${e.message}`);
+  }
 
   return { url: urlNow, html };
 }
@@ -303,15 +293,8 @@ async function createSession(startUrl) {
   const sessionId = crypto.randomBytes(16).toString("hex");
   log("INFO", `New renderer session ${sessionId}: goto ${startUrl}`);
 
-  const { url, html } = await capturePageAssets(
-    sessionId,
-    page,
-    () =>
-      page.goto(startUrl, {
-        waitUntil: "networkidle",
-        timeout: 60000
-      }),
-    { requireIdle: false }
+  const { url, html } = await runActionWithAssets(sessionId, page, () =>
+    page.goto(startUrl)
   );
 
   sessions.set(sessionId, { context, page, lastUrl: url });
@@ -332,15 +315,8 @@ async function navSession(sessionId, href) {
 
   log("INFO", `Session ${sessionId}: nav to ${targetUrl}`);
 
-  const { url, html } = await capturePageAssets(
-    sessionId,
-    page,
-    () =>
-      page.goto(targetUrl, {
-        waitUntil: "networkidle",
-        timeout: 60000
-      }),
-    { requireIdle: false }
+  const { url, html } = await runActionWithAssets(sessionId, page, () =>
+    page.goto(targetUrl)
   );
   sess.lastUrl = url;
 
@@ -356,13 +332,11 @@ async function submitSession(sessionId, fields) {
   const { page, lastUrl } = sess;
   log("INFO", `Session ${sessionId}: submit form on ${lastUrl || page.url()}`);
 
-  // НЕ кидаем ошибку, если формы нет — просто вернём текущий html.
-  const action = async () => {
-    const didSubmit = await page.evaluate((fields) => {
+  const action = () =>
+    page.evaluate((fields) => {
       const form = document.querySelector("form");
       if (!form) {
-        console.warn("No <form> found on the page");
-        return false;
+        throw new Error("No <form> found on the page");
       }
 
       for (const [name, value] of Object.entries(fields)) {
@@ -376,22 +350,9 @@ async function submitSession(sessionId, fields) {
       }
 
       form.submit();
-      return true;
     }, fields);
 
-    if (!didSubmit) {
-      // форма не найдена — ничего не делаем, просто вернём текущий снимок
-      log(
-        "INFO",
-        `Session ${sessionId}: submit called, but no <form> found; returning current HTML`
-      );
-    }
-  };
-
-  // После submit ждём немного networkidle, но НЕ падаем по таймауту.
-  const { url, html } = await capturePageAssets(sessionId, page, action, {
-    requireIdle: true
-  });
+  const { url, html } = await runActionWithAssets(sessionId, page, action);
   sess.lastUrl = url;
 
   return { url, html };
@@ -440,7 +401,7 @@ app.post("/session/nav", async (req, res) => {
   }
 });
 
-// Сабмит формы (капчи/логин/прочие POST)
+// Сабмит формы (например, капча/логин)
 app.post("/session/submit", async (req, res) => {
   const { sessionId, fields } = req.body || {};
   if (!sessionId || !fields || typeof fields !== "object") {
