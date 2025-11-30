@@ -3,12 +3,12 @@
 
 “Удалённый браузер” поверх Tor:  
 под капотом крутится настоящий Chromium (Playwright + Tor),  
-а пользователю отдаётся только **HTML-снимок** страницы с нашими инжектами и плагинами.
+а пользователю отдаётся только **HTML-снимок** страницы с нашими плагинами и инжектами.
 
 Ключевая идея:
 
 > Клиент **никогда не ходит** к таргету напрямую.  
-> Все запросы к сайту делает только headless-браузер.  
+> Все запросы к сайту делает **только headless-браузер** (Playwright через Tor).  
 > Пользователь видит только результат (HTML) и взаимодействует через прокси.
 
 ---
@@ -17,32 +17,47 @@
 
 Проект состоит из трёх сервисов:
 
-- **`bui-tor`** — Tor в Docker:
+- **`bui-tor`** (`tor/`):
+  - Tor в Docker;
   - SOCKS-прокси `socks5://tor:9050` для Playwright;
-  - опционально: `.onion` hidden service для `bui-proxy-ui`.
+  - hidden service для `bui-proxy-ui`, ключи лежат в `tor/keys` (адрес `proxy…onion`).
 
-- **`bui-renderer`** (`renderer/`) — headless Chromium:
-  - поднимает один экземпляр браузера (Playwright);
-  - через Tor открывает страницы (`TARGET_URL` и навигацию по ссылкам/формам);
-  - собирает CSS и картинки и **инлайнит** их в HTML (через `<style>` и `data:` URI);
+- **`bui-renderer`** (`renderer/`):
+  - Node.js + Playwright (Chromium);
+  - поднимает один браузер и несколько контекстов (сеансов);
+  - для каждого сеанса:
+    - открывает страницы через Tor;
+    - собирает CSS и картинки;
+    - инлайнит стили и `<img>` в HTML;
   - API:
-    - `POST /session/start { url }` → запускает новую сессию, возвращает `{ sessionId, url, html }`;
-    - `POST /session/nav { sessionId, href }` → навигация внутри сессии, возвращает `{ url, html }`.
+    - `POST /session/start { url }` → `{ sessionId, url, html }`;
+    - `POST /session/nav { sessionId, href }` → `{ url, html }`;
+    - `POST /session/submit { sessionId, fields }` → `{ url, html }`.
 
-- **`bui-proxy-ui`** (`proxy-ui/`) — фронтовый HTTP-прокси:
-  - принимает запросы от браузера пользователя;
+- **`bui-proxy-ui`** (`proxy-ui/`):
+  - Express-приложение для браузера пользователя;
   - ведёт свои сессии по cookie `bui_sid`;
   - для каждой сессии создаёт **одну** Playwright-сессию (`rendererSessionId`);
-  - отдаёт пользователю HTML, модифицированный плагинами и с инжектированным JS;
-  - JS на стороне клиента перехватывает клики/формы и отправляет действия обратно в `bui-proxy-ui` → `bui-renderer`.
+  - отдаёт HTML, модифицированный плагинами (`Cheerio`) и с инжектированным JS;
+  - клиентский JS:
+    - перехватывает клики по ссылкам и submit форм;
+    - отправляет действия на `/__act/nav` и `/__act/submit`;
+    - получает новый HTML-снимок и полностью перерисовывает страницу.
 
-Схема:
+Упрощённая схема:
 
 ```text
-Браузер пользователя ── HTTP ──> bui-proxy-ui ──HTTP/JSON──> bui-renderer ──> Tor ──> .onion/.web
-       ↑                           ↑
-       |                           |
-    инжектируемый JS           плагины (Cheerio)
+   Browser (user)
+         │
+         │ HTTP (GET /, POST /__act/*)
+         ▼
+   bui-proxy-ui (Express)
+         │ JSON (session/start|nav|submit)
+         ▼
+   bui-renderer (Playwright → Tor)
+         │
+         ▼
+   .onion / clearnet сайты
 ````
 
 ---
@@ -56,32 +71,32 @@ browser-ui-proxy/
   tor/
     Dockerfile
     torrc
-    keys/                      # здесь ваши hs_ed25519_* и hostname (если есть)
+    keys/                      # hs_ed25519_* + hostname
 
   renderer/
     Dockerfile
     package.json
     src/
-      server.js                # API: /session/start, /session/nav
+      server.js                # API: /session/start, /session/nav, /session/submit
 
   proxy-ui/
     Dockerfile
     package.json
     src/
-      server.js                # основной HTTP-сервер для клиента
+      server.js                # HTTP-прокси для пользователей
       plugins/
         index.js               # движок плагинов (Cheerio)
-        config.json            # настройка плагинов
+        config.json            # конфиг плагинов
         append-to-title.js     # пример плагина
       injected/
-        client.js              # JS, который инжектится на страницу
+        client.js              # инжектируемый JS
 ```
 
 ---
 
 ## docker-compose
 
-Полный `docker-compose.yml`:
+`docker-compose.yml`:
 
 ```yaml
 version: "3.9"
@@ -94,10 +109,6 @@ services:
     networks:
       - bui-net
     volumes:
-      # Здесь лежат ваши готовые ключи hidden service
-      # tor/keys/hs_ed25519_secret_key
-      # tor/keys/hs_ed25519_public_key
-      # tor/keys/hostname
       - ./tor/keys:/var/lib/tor/bui-onion-proxy
 
   renderer:
@@ -121,7 +132,6 @@ services:
     networks:
       - bui-net
     environment:
-      # Стартовая страница, которую будет открывать Playwright
       - TARGET_URL=http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/
       - PORT=8080
       - RENDERER_URL=http://renderer:3001
@@ -135,13 +145,12 @@ networks:
 
 ---
 
-## Tor и hidden service (`bui-tor`)
+## Tor (`bui-tor`)
 
 ### `tor/Dockerfile`
 
 ```dockerfile
 FROM alpine:3.19
-
 RUN apk add --no-cache tor
 
 # создаём директорию под hidden service
@@ -161,7 +170,6 @@ SocksPolicy accept *
 
 Log notice stdout
 
-# Hidden service для нашего browser-ui-proxy
 HiddenServiceDir /var/lib/tor/bui-onion-proxy
 HiddenServiceVersion 3
 HiddenServicePort 80 bui-proxy-ui:8080
@@ -169,34 +177,31 @@ HiddenServicePort 80 bui-proxy-ui:8080
 
 ### Ключи hidden service
 
-Если у вас уже есть готовый `.onion` (например, начинающийся с `proxy...`):
+В `tor/keys` должны лежать:
 
-* положите в `tor/keys` в корне проекта три файла:
+```text
+tor/keys/
+  hs_ed25519_secret_key
+  hs_ed25519_public_key
+  hostname
+```
 
-  ```text
-  tor/keys/
-    hs_ed25519_secret_key
-    hs_ed25519_public_key
-    hostname
-  ```
+Рекомендуемые права:
 
-* выставьте права:
-
-  ```bash
-  chmod 700 tor/keys
-  chmod 600 tor/keys/hs_ed25519_secret_key
-  chmod 644 tor/keys/hs_ed25519_public_key
-  chmod 644 tor/keys/hostname
-  ```
+```bash
+chmod 700 tor/keys
+chmod 600 tor/keys/hs_ed25519_secret_key
+chmod 644 tor/keys/hs_ed25519_public_key
+chmod 644 tor/keys/hostname
+```
 
 После запуска:
 
 ```bash
-docker compose up -d tor
 docker compose exec tor cat /var/lib/tor/bui-onion-proxy/hostname
 ```
 
-Вы увидите свой `.onion`-адрес proxy — именно его будут использовать пользователи в Tor Browser.
+→ это твой `.onion`-адрес прокси (например, начиная с `proxy…onion`).
 
 ---
 
@@ -230,37 +235,126 @@ CMD ["node", "src/server.js"]
   },
   "dependencies": {
     "express": "^4.19.0",
-    "playwright": "1.47.0"
+    "playwright": "1.47.0",
+    "cheerio": "^1.0.0-rc.12"
   }
 }
 ```
 
-### Логика renderer
+### Логика renderer (с учётом текущего кода)
 
-* Один глобальный Chromium (Playwright);
-* `sessions` (Map): `sessionId -> { context, page, lastUrl }`;
-* API:
+* Глобальный Chromium (`chromium.launch`) с прокси `TOR_SOCKS`.
+* `sessions` (Map): `sessionId -> { context, page, lastUrl }`.
 
-  * `POST /session/start { url }`:
+#### Сбор HTML + CSS + картинок
 
-    * создаёт `browserContext` + `page`;
-    * делает `page.goto(url, { waitUntil: "networkidle" })`;
-    * слушает все `response`:
+Функция `runActionWithAssets(sessionId, page, action)`:
 
-      * для `text/css` собирает CSS;
-      * для картинок (`image/*`) собирает `body()` и конвертирует в base64;
-    * переписывает `url(...)` внутри CSS на `data:image/...;base64,...` (если картинка есть);
-    * инлайнит CSS в `<style>` в `<head>`;
-    * возвращает `{ sessionId, url, html }`.
+* вешает `page.on("response")`:
 
-  * `POST /session/nav { sessionId, href }`:
+  * если `text/css` → собирает CSS в `cssChunks`;
+  * если `image/*` → кладёт байты в `imageMap` (key = полный URL).
 
-    * находит `sessionId`;
-    * строит новый URL относительно `lastUrl`;
-    * делает тот же `gotoWithInlineCssAndImages`;
-    * возвращает `{ url, html }`.
+* параллельно делает:
 
-Рендерер **полностью сам** ходит по Tor к таргету, загружает CSS и картинки и отдаёт уже собранный HTML.
+  ```js
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: "networkidle", timeout: 60000 }),
+    action()
+  ]);
+  ```
+
+  где `action()` — либо `page.goto(url)`, либо `page.evaluate(form.submit)`.
+
+* затем берёт `html = await page.content()`, `urlNow = page.url()`;
+
+* инлайнит:
+
+  1. **CSS**: вставляет `<style>...cssChunks...</style>` перед `</head>`;
+  2. **фоновые картинки**: переписывает `url(...)` в CSS на `data:image/...;base64,...` если URL есть в `imageMap`;
+  3. **картинки товара**:
+
+     * перебирает `<img>`:
+
+       * сначала `data-src`, `data-original`, затем `src` и `srcset`;
+       * если URL найдён в `imageMap` → делает `src="data:image/...;base64,..."`;
+     * перебирает `<source srcset>` в `<picture>`:
+
+       * аналогично преобразует в `data:` URI.
+
+→ На выходе получается **самодостаточный HTML**: стили и картинки встроены, браузеру пользователя не нужно ходить за `/css/*.css` или `/storage/image/*.webp`.
+
+#### `/session/start`
+
+```js
+app.post("/session/start", async (req, res) => {
+  const url = req.body?.url;
+  const br = await getBrowser();
+  const context = await br.newContext();
+  const page = await context.newPage();
+  const sessionId = crypto.randomBytes(16).toString("hex");
+
+  const { url: urlNow, html } = await runActionWithAssets(
+    sessionId,
+    page,
+    () => page.goto(url)
+  );
+
+  sessions.set(sessionId, { context, page, lastUrl: urlNow });
+  res.json({ sessionId, url: urlNow, html });
+});
+```
+
+#### `/session/nav`
+
+```js
+app.post("/session/nav", async (req, res) => {
+  const { sessionId, href } = req.body;
+  const sess = sessions.get(sessionId);
+  const { page, lastUrl } = sess;
+  const baseUrl = lastUrl || page.url() || href;
+  const targetUrl = new URL(href, baseUrl).toString();
+
+  const { url, html } = await runActionWithAssets(
+    sessionId,
+    page,
+    () => page.goto(targetUrl)
+  );
+  sess.lastUrl = url;
+  res.json({ url, html });
+});
+```
+
+#### `/session/submit`
+
+```js
+app.post("/session/submit", async (req, res) => {
+  const { sessionId, fields } = req.body;
+  const sess = sessions.get(sessionId);
+  const { page, lastUrl } = sess;
+
+  const action = () =>
+    page.evaluate((fields) => {
+      const form = document.querySelector("form");
+      if (!form) {
+        throw new Error("No <form> found on the page");
+      }
+      for (const [name, value] of Object.entries(fields)) {
+        const el = form.querySelector(`[name="${name}"]`);
+        if (!el) continue;
+        const tag = el.tagName.toLowerCase();
+        if (tag === "input" || tag === "textarea" || tag === "select") {
+          el.value = value;
+        }
+      }
+      form.submit(); // настоящий POST внутри Playwright
+    }, fields);
+
+  const { url, html } = await runActionWithAssets(sessionId, page, action);
+  sess.lastUrl = url;
+  res.json({ url, html });
+});
+```
 
 ---
 
@@ -301,64 +395,145 @@ CMD ["node", "src/server.js"]
 
 ### Сессии в proxy-ui
 
-* cookie `bui_sid`:
+* Cookie `bui_sid`:
 
-  * если нет — генерится `crypto.randomBytes(16).toString("hex")`;
-  * выдаётся через `Set-Cookie: bui_sid=...; HttpOnly; SameSite=Lax; Path=/`.
+  * если нет — генерим `crypto.randomBytes(16)`;
+  * выставляем `Set-Cookie: bui_sid=...; HttpOnly; SameSite=Lax; Path=/`.
 
 * `sessions` (Map):
 
-  ```js
-  sessions[bui_sid] = {
-    rendererSessionId,  // id сессии в renderer
-    lastHtml,           // последний HTML
-    lastUrl,            // последний URL в Playwright
-    createdAt
-  };
-  ```
+```js
+sessions[bui_sid] = {
+  rendererSessionId, // id сессии в renderer
+  lastHtml,          // последний HTML-снимок
+  lastUrl,           // последний URL Playwright
+  createdAt
+};
+```
 
-### Входная точка `/` (GET)
+### Основные эндпоинты
 
-* Находит или создаёт сессию по `bui_sid`.
-* Если `rendererSessionId` ещё нет:
+#### `GET /` — начальная загрузка
 
-  * вызывает `renderer /session/start { TARGET_URL }`;
-  * сохраняет `rendererSessionId`, `lastHtml`, `lastUrl`.
-* Берёт текущий `lastHtml`, прогоняет через:
+* берём/создаём сессию по `bui_sid`;
+* если `rendererSessionId` ещё нет:
+
+  * вызываем `POST renderer /session/start { TARGET_URL }`;
+  * сохраняем `rendererSessionId`, `lastHtml`, `lastUrl`;
+* если `lastHtml` пустой — обновляем через `/session/nav`;
+* прогоняем `lastHtml` через:
 
   * `rewriteHtml` (плагины),
   * `injectClientJs` (вставка `client.js` в `<body>`),
-* отдаёт HTML пользователю.
+* отдаём HTML.
 
-### Навигация `/__act/nav` (POST)
+#### `POST /__act/nav` — навигация по ссылкам / GET-формам
 
-Инжектируемый JS перехватывает клики по ссылкам и отправляет:
+* вызывается из инжекта при клике по ссылке или сабмите GET-формы;
+* тело: `{ href }`, где `href` уже относительный `"/path?query#hash"`.
 
-```json
-POST /__act/nav
-{ "href": "/path?query" }
+На сервере:
+
+```js
+app.post("/__act/nav", async (req, res) => {
+  const { sid, data } = getOrCreateSession(req, res);
+  const href = req.body?.href || "";
+  if (!data.rendererSessionId) {
+    const startRes = await rendererStart(TARGET_URL);
+    data.rendererSessionId = startRes.sessionId;
+    data.lastHtml = startRes.html;
+    data.lastUrl = startRes.url;
+  }
+  const { url, html } = await rendererNav(data.rendererSessionId, href);
+  data.lastHtml = html;
+  data.lastUrl = url;
+
+  const out = applyTransforms(html, req, data);
+  res.type("text/html; charset=utf-8").send(out);
+});
 ```
 
-* proxy-ui:
+#### `POST /__act/submit` — POST-формы (капча, логин, walkthrough)
 
-  * по `bui_sid` находит `rendererSessionId`;
-  * вызывает `renderer /session/nav { sessionId, href }`;
-  * получает `{ url, html }`;
-  * сохраняет `lastHtml`, `lastUrl`;
-  * прогоняет через плагины и инъекцию;
-  * возвращает HTML.
+* вызывается из инжекта при сабмите `method=POST`;
+* тело: `{ fields: { name: value, ... } }`.
 
-На клиенте:
+На сервере:
 
-* `client.js` делает:
+```js
+app.post("/__act/submit", async (req, res) => {
+  const { sid, data } = getOrCreateSession(req, res);
+  const fields = req.body?.fields || null;
+  if (!fields || typeof fields !== "object") {
+    return res.status(400).send("fields object is required");
+  }
 
-  ```js
-  document.open();
-  document.write(newHtml);
-  document.close();
-  ```
+  if (!data.rendererSessionId) {
+    const startRes = await rendererStart(TARGET_URL);
+    data.rendererSessionId = startRes.sessionId;
+    data.lastHtml = startRes.html;
+    data.lastUrl = startRes.url;
+  }
 
-→ Страница полностью “перерисовывается” на свежий снимок из Playwright.
+  const { url, html } = await rendererSubmit(
+    data.rendererSessionId,
+    fields
+  );
+  data.lastHtml = html;
+  data.lastUrl = url;
+
+  const out = applyTransforms(html, req, data);
+  res.type("text/html; charset=utf-8").send(out);
+});
+```
+
+Таким образом:
+
+* пользователь → `/__act/submit` → proxy-ui → renderer `/session/submit` → **настоящий** `form.submit()` в Playwright;
+* всё происходит в одной sессии браузера (cookie, капча, редиректы).
+
+---
+
+## Инжектируемый JS (`proxy-ui/src/injected/client.js`)
+
+Функции:
+
+* `toProxyRelative(href)`:
+
+  * конвертирует любой URL (`http://proxy...onion/...`, `/path`, `?q=`) в вид `"/path?query#hash"`;
+* `navigateViaProxy(href)`:
+
+  * `POST /__act/nav { href: rel }`,
+  * `document.open/write/close(newHtml);`
+* `submitViaProxy(fields)`:
+
+  * `POST /__act/submit { fields }`,
+  * `document.open/write/close(newHtml);`
+
+Перехват событий:
+
+* `click` по `<a href="...">`:
+
+  * игнорируем `#anchor` и `javascript:...`;
+  * `preventDefault`;
+  * `navigateViaProxy(href)`.
+* `submit` формы:
+
+  * собираем `FormData` в объект `fields`;
+  * если `method="GET"`:
+
+    * забиваем поля в query к action/currentPath → `navigateViaProxy(url)`;
+  * если `method="POST"`:
+
+    * отправляем `submitViaProxy(fields)`.
+
+Плюс добавляется маленький бейдж:
+
+```text
+⚠ via browser-ui-proxy
+```
+
+в правый нижний угол, чтобы пользователь всегда видел, что работает через прокси.
 
 ---
 
@@ -382,28 +557,29 @@ POST /__act/nav
 
 ### Движок: `proxy-ui/src/plugins/index.js`
 
-* Загружает `config.json`;
-
+* загружает конфиг;
 * `require`-ит плагины из `./<name>.js`;
+* для каждого HTML вызывает `plugin.process($, ctx)`.
 
-* Для каждого HTML-ответа вызывает `plugin.process($, ctx)`:
+Контекст:
 
-  ```js
-  const ctx = {
-    config,        // общий конфиг (пока не используем)
-    session,       // объект сессии proxy-ui
-    logger,        // { info, error }
-    request: {     // данные запроса к proxy-ui
-      url,
-      method,
-      headers
-    }
-  };
-  ```
+```js
+const ctx = {
+  config,
+  session, // объект сессии proxy-ui
+  logger: {
+    info: (m) => log("INFO", m),
+    error: (m) => log("ERR", m)
+  },
+  request: {
+    url: req.url,
+    method: req.method,
+    headers: req.headers
+  }
+};
+```
 
-* `process($, ctx)` работает через Cheerio (`$` — jQuery-подобный объект).
-
-Пример плагина `append-to-title.js`:
+Пример `append-to-title.js`:
 
 ```js
 function process($, ctx) {
@@ -434,142 +610,113 @@ module.exports = { process };
 
 ---
 
-## Инжектируемый JS: `proxy-ui/src/injected/client.js`
+## Запуск и ресет стека
 
-Функции:
-
-* перехватывает клики по `<a href="...">`:
-
-  * игнорирует `href="#"`, `javascript:...`;
-  * делает `preventDefault()` и вызывает `/__act/nav`.
-
-* перехватывает submit форм:
-
-  * собирает `FormData`;
-  * пока все формы (и GET, и POST) конвертируются в GET с query-параметрами и тоже идут через `/__act/nav`;
-  * это временное упрощение прототипа.
-
-* рисует маленький бейдж в углу (`⚠ via browser-ui-proxy`), чтобы пользователь видел, что страница идёт через прокси.
-
----
-
-## Как запускать
+### Первый запуск
 
 ```bash
-cd browser-ui-proxy
+cd /home/kali/browser-ui-proxy
 
 docker compose build
 docker compose up -d
-
 docker compose ps
-docker compose logs -f proxy-ui
-docker compose logs -f renderer
-docker compose logs -f bui-tor
 ```
 
-### Проверка локально
+Проверка:
 
-Открой:
+* `docker compose logs -f tor`
+* `docker compose logs -f renderer`
+* `docker compose logs -f proxy-ui`
 
-* `http://localhost:8081/`
+Локальный доступ:
 
-Должно быть:
+```text
+http://localhost:8081/
+```
 
-* грузится стартовая страница (`TARGET_URL`), но через Playwright+Tor;
-* в `<title>` добавляется `[BROWSER-UI-PROXY]`;
-* в правом нижнем углу — бейдж;
-* клики по ссылкам и простые GET-формы работают (навигация идёт через proxy-ui → renderer).
-
-### Проверка через Tor
-
-Если настроен hidden service (и ключи в `tor/keys` валидны):
+Tor Browser:
 
 ```bash
 docker compose exec tor cat /var/lib/tor/bui-onion-proxy/hostname
 ```
 
-Полученный `.onion` можно открыть в Tor Browser:
+→ открыть полученный `.onion` в Tor Browser.
 
-* адрес будет начинаться, например, с `proxy...onion` (если такие ключи были изначально);
-* внутри — тот же UI, что и через `localhost:8081`, но уже как скрытый сервис.
+### Полный ресет стека (когда Tor/сети шалят)
+
+```bash
+cd /home/kali/browser-ui-proxy
+
+# остановить и удалить контейнеры, сети, анонимные volume'ы
+docker compose down --volumes --remove-orphans
+
+# убедиться, что tor/keys сохранены и с правильными правами
+ls -l tor/keys
+chmod 700 tor/keys
+chmod 600 tor/keys/hs_ed25519_secret_key
+chmod 644 tor/keys/hs_ed25519_public_key
+chmod 644 tor/keys/hostname
+
+# пересборка и запуск с нуля
+docker compose build --no-cache
+docker compose up -d
+```
 
 ---
 
 ## Многопользовательский режим
 
-Архитектура из коробки поддерживает **много пользователей**:
+Архитектура уже **поддерживает несколько пользователей параллельно**:
 
-* У каждого клиента:
+* У каждого клиента свой `bui_sid` (cookie);
+* У каждого `bui_sid` — своя запись в `sessions[bui_sid]`;
+* У каждой записи — свой `rendererSessionId`, а в renderer — свой `browserContext+page`.
 
-  * свой `bui_sid` (cookie),
-  * своя запись в `sessions` (proxy-ui),
-  * свой `rendererSessionId` → отдельный Playwright `context + page`.
-
-Т.е.:
+То есть:
 
 ```text
-user A: bui_sid=A → rendererSessionId=RA → свой браузер
-user B: bui_sid=B → rendererSessionId=RB → другой браузер
+user A: bui_sid=A → rendererSessionId=R1 → свой headless-браузер
+user B: bui_sid=B → rendererSessionId=R2 → другой браузер
 ```
 
 Они не мешают друг другу:
 
-* разные cookie, разные цепочки Tor, разные капчи и т.д.
+* свои cookie, свои капчи, свои логины, свой прогретый UI.
 
-Для продакшена можно:
+Для тяжёлой нагрузки можно:
 
-* вынести сессии в внешнее хранилище (Redis/PostgreSQL);
-* ограничить время жизни сессий (закрывать старые `rendererSessionId`);
-* масштабировать `renderer` горизонтально (несколько инстансов за балансировщиком).
-
----
-
-## Ограничения и TODO
-
-На текущий момент:
-
-* Формы:
-
-  * любые формы (GET/POST) сейчас **преобразуются в GET** с query-параметрами;
-  * нужно будет добавить полноценный endpoint `/__act/submit` + соответствующий метод `/session/submit` в renderer, чтобы честно эмулировать POST внутри Playwright.
-
-* JS сайта:
-
-  * В браузер пользователя попадает ровно тот HTML, который вернул Playwright (с нашим плагинным патчем);
-  * JS сайта внутри HTML исполняется у клиента (плюс наш инжект);
-  * при необходимости можно добавить дополнительные защиты (перехват `window.location`, логирование/торможение некоторых действий).
-
-* Сессии:
-
-  * сейчас сессии хранятся в памяти процесса `proxy-ui`;
-  * при рестарте контейнера сессии теряются.
-
-Планы на будущее:
-
-* добавить полноценную поддержку POST-форм через отдельный API до renderer;
-* добавить PostgreSQL/Redis для аналитики и персистентных сессий;
-* накидать больше HTML-плагинов (модификация блоков интерфейса, скрытие элементов, тестовые баннеры и т.п.);
-* добавить лимит редиректов и дружелюбные сообщения пользователю, если сайт крутит бесконечные 302.
+* вынести сессии в Redis/БД;
+* добавлять таймауты жизни контекстов;
+* горизонтально масштабировать `renderer` и `proxy-ui`.
 
 ---
 
-## Итог
+## Известные ограничения (в текущем состоянии)
 
-`browser-ui-proxy` в текущем состоянии — это уже:
+* **Индикатор активности браузера (native spinner)**:
 
-* настоящий **“browser-as-a-proxy”** движок:
+  * так как навигация происходит через `fetch + document.write()`, браузер считает это “AJAX” и **не крутит свой спиннер**;
+  * мы сознательно не внедряем оверлей/спиннер, чтобы не мешать UI — пользователь должен понимать, что это именно инструмент для UI-тестов.
 
-  * вся логика сайта (капчи, редиректы, shop2go, JS) отрабатывает внутри Playwright;
-  * пользователь видит только HTML+CSS+картинки, отрендеренные внутри headless-браузера;
-* платформа для:
+* **JS-логика, завязанная только на клиент**:
 
-  * UI-тестирования,
-  * экспериментов с HTML-плагинами,
-  * аналитики пользовательских действий (клики/формы),
-  * аккуратного проксирования сложных .onion/.web сайтов.
+  * модалки/walkthrough, которые живут исключительно в DOM/`localStorage` и не ходят на сервер, могут вести себя чуть иначе, чем в реальном браузере;
+  * мы синхронизируем **формы и переходы**, а не весь жизненный цикл DOM между снапшотами.
 
-Дальше его можно только наращивать: больше плагинов, больше аналитики и умной логики поверх уже стабильного ядра.
+* **Загрузка тяжёлых страниц**:
 
-```
-::contentReference[oaicite:0]{index=0}
-```
+  * из-за инлайна всех CSS и картинок первый запрос/переход может быть тяжелее по времени и размеру ответа;
+  * зато результат — стабильный, полностью самодостаточный HTML-снапшот для анализа UI.
+
+---
+
+## Итоги
+
+В текущем состоянии:
+
+* capcha/логины/сложные формы проходят через `__act/submit → session/submit → form.submit()` в Playwright;
+* UI (включая фон и картинки товаров) полностью рендерится через headless Chromium и инлайнится;
+* весь трафик к таргетам идёт через один headless-браузер на сессию по Tor;
+* пользователь взаимодействует только с `browser-ui-proxy`, не трогая таргет напрямую.
+
+Этот README описывает **ровно то состояние**, в котором сейчас работает твой стек. Если что-то ещё доработаем, можно будет просто дописать соответствующий раздел.
